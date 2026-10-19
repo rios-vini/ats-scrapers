@@ -10,6 +10,7 @@ pin:
 2. Detail-API enrichment (description, employment type, etc.)
 3. Retry behaviour (404 fail-fast, 429/5xx retry with backoff)
 4. Whitespace + HTML entity handling
+5. JSON widget responses (Oct 2026 rollout: same URL serves pure JSON)
 """
 
 from __future__ import annotations
@@ -468,3 +469,197 @@ def test_description_is_truncated(httpx_mock) -> None:
     job = BambooHRScraper("acme").fetch()[0]
     assert job.description is not None
     assert len(job.description) <= 25_000
+
+
+# --- JSON widget responses (Oct 2026 rollout) --------------------------------
+
+
+def _widget_json(
+    departments: list[dict[str, Any]], *, success: bool = True
+) -> dict[str, Any]:
+    """Build an `/jobs/embed2.php` JSON response in the shape observed live
+    (Oct 2026, e.g. bcg.bamboohr.com): top-level labels are template text,
+    the listing lives in ``departments[].positions[]``."""
+    return {
+        "version": None,
+        "labels": {
+            "heading": "Open Positions",
+            "blankStateTitle": "We currently have no open positions.",
+            "blankStateBody": (
+                "Please check back as we will most certainly be looking "
+                "for great people to join our team in the future."
+            ),
+        },
+        "departments": departments,
+        "success": success,
+    }
+
+
+def test_parses_json_widget_response(httpx_mock) -> None:
+    """Some tenants now serve the widget URL as pure JSON carrying the same
+    jobs the HTML widget used to — the scraper must detect the content and
+    emit rows in the same shape as the HTML path."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 19228,
+                    "label": "Architecture & Service Excellence",
+                    "positions": [
+                        {
+                            "id": 81,
+                            "name": "Atlassian Platform & ITSM Engineer",
+                            "url": "https://acme.bamboohr.com/careers/81",
+                            "location": "Remote",
+                        }
+                    ],
+                },
+                {
+                    "id": 18727,
+                    "label": "EIDS",
+                    "positions": [
+                        {
+                            "id": 80,
+                            "name": "Release Train Engineer (RTE) - DHMS",
+                            "url": "https://acme.bamboohr.com/careers/80",
+                            "location": "Remote",
+                        }
+                    ],
+                },
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert [(j.ats_id, j.title, j.location, j.department) for j in jobs] == [
+        (
+            "81",
+            "Atlassian Platform & ITSM Engineer",
+            "Remote",
+            "Architecture & Service Excellence",
+        ),
+        ("80", "Release Train Engineer (RTE) - DHMS", "Remote", "EIDS"),
+    ]
+    assert str(jobs[0].url) == "https://acme.bamboohr.com/careers/81"
+    assert jobs[0].company == "acme"
+    assert jobs[0].ats_type is ATSType.BAMBOOHR
+
+
+def test_json_widget_blank_state_returns_empty(httpx_mock) -> None:
+    """``labels.blankStateTitle`` is template text present in every
+    response; a JSON body with an empty ``departments`` list is a genuine
+    zero-jobs tenant — return [] rather than raising."""
+    httpx_mock.add_response(url=WIDGET_URL, json=_widget_json([]))
+    assert BambooHRScraper("acme", include_descriptions=False).fetch() == []
+
+
+def test_json_widget_dedupes_same_id_across_departments(httpx_mock) -> None:
+    """Cross-listed roles appear under several departments — keep one row,
+    mirroring the HTML path."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [{"id": 100, "name": "X", "location": "A"}],
+                },
+                {
+                    "id": 2,
+                    "label": "Product",
+                    "positions": [{"id": 100, "name": "X", "location": "A"}],
+                },
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert len(jobs) == 1
+
+
+def test_json_widget_derives_url_when_missing(httpx_mock) -> None:
+    """Positions may omit ``url`` — fall back to the share-URL template."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [{"id": 100, "name": "X", "location": "Y"}],
+                }
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert str(jobs[0].url) == "https://acme.bamboohr.com/careers/100"
+
+
+def test_json_widget_handles_missing_location_and_label(httpx_mock) -> None:
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "positions": [
+                        {
+                            "id": 100,
+                            "name": "X",
+                            "url": "https://acme.bamboohr.com/careers/100",
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert jobs[0].location is None
+    assert jobs[0].department is None
+
+
+def test_json_widget_raises_when_positions_do_not_match_parser(
+    httpx_mock,
+) -> None:
+    """Same guard as the HTML path: positions exist in the payload but none
+    are usable — raise instead of silently returning an empty listing."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [
+                        {"id": 100},      # no name
+                        {"name": "Y"},    # no id
+                    ],
+                }
+            ]
+        ),
+    )
+    with pytest.raises(ScraperError, match="contains jobs but none matched"):
+        BambooHRScraper("acme", include_descriptions=False).fetch()
+
+
+def test_json_widget_enriches_descriptions_via_detail_api(httpx_mock) -> None:
+    """JSON-listed jobs hydrate from `/careers/{id}/detail` exactly like
+    HTML-listed ones."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [{"id": 100, "name": "X", "location": "Y"}],
+                }
+            ]
+        ),
+    )
+    httpx_mock.add_response(
+        url="https://acme.bamboohr.com/careers/100/detail",
+        json=_detail_payload(description="<p>Working</p>"),
+    )
+    job = BambooHRScraper("acme").fetch()[0]
+    assert job.description == "Working"
