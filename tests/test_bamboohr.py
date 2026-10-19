@@ -663,3 +663,78 @@ def test_json_widget_enriches_descriptions_via_detail_api(httpx_mock) -> None:
     )
     job = BambooHRScraper("acme").fetch()[0]
     assert job.description == "Working"
+
+
+def test_json_widget_success_false_raises(httpx_mock) -> None:
+    """An explicit application-level failure must not masquerade as an
+    empty board — raise instead of returning a clean []."""
+    httpx_mock.add_response(url=WIDGET_URL, json=_widget_json([], success=False))
+    with pytest.raises(ScraperError, match="success=false"):
+        BambooHRScraper("acme", include_descriptions=False).fetch()
+
+
+def test_json_widget_malformed_url_falls_back_to_share_url(httpx_mock) -> None:
+    """A position URL that carries the http prefix but no host (e.g.
+    "https://") must not blow up the whole board — fall back to the
+    derived share URL like a missing one."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [
+                        {"id": 100, "name": "Good", "url": "https://", "location": "Y"},
+                        {"id": 101, "name": "Fine", "location": "Z"},
+                    ],
+                }
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert [j.ats_id for j in jobs] == ["100", "101"]
+    assert str(jobs[0].url) == "https://acme.bamboohr.com/careers/100"
+
+
+def test_json_widget_skips_blank_id(httpx_mock) -> None:
+    """A blank id ("" or whitespace) would produce a `/careers/` row with
+    a meaningless id — skip it and keep the valid rows."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [
+                        {"id": "", "name": "Broken", "location": "A"},
+                        {"id": "  ", "name": "Also Broken", "location": "B"},
+                        {"id": 100, "name": "Valid", "location": "C"},
+                    ],
+                }
+            ]
+        ),
+    )
+    jobs = BambooHRScraper("acme", include_descriptions=False).fetch()
+    assert [j.ats_id for j in jobs] == ["100"]
+
+
+def test_json_widget_non_dict_positions_raise_guard(httpx_mock) -> None:
+    """Every entry in a non-empty `positions` array counts toward the
+    parse guard — a payload of garbage entries must raise, not read as an
+    empty tenant."""
+    httpx_mock.add_response(
+        url=WIDGET_URL,
+        json=_widget_json(
+            [
+                {
+                    "id": 1,
+                    "label": "Engineering",
+                    "positions": [42, "not-a-dict", None],
+                }
+            ]
+        ),
+    )
+    with pytest.raises(ScraperError, match="contains jobs but none matched"):
+        BambooHRScraper("acme", include_descriptions=False).fetch()

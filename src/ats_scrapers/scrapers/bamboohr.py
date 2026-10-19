@@ -49,6 +49,7 @@ import json
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
+from urllib.parse import urlsplit
 
 from pydantic import HttpUrl
 
@@ -179,9 +180,15 @@ class BambooHRScraper(BaseScraper):
             # HTML widget. Detection is content-based: a body starting
             # with `{` is decoded as JSON; a decode failure falls through
             # to the HTML parser, so HTML tenants behave exactly as before.
+            # Only the ``json.loads`` decode is guarded — a malformed
+            # payload must raise loudly, not silently hide the board.
             if widget_html.lstrip().startswith("{"):
-                with contextlib.suppress(ValueError):
-                    jobs = self._parse_widget_json(json.loads(widget_html))
+                try:
+                    payload = json.loads(widget_html)
+                except ValueError:
+                    payload = None
+                if payload is not None:
+                    jobs = self._parse_widget_json(payload)
                     if self.include_descriptions and jobs:
                         await self._enrich_from_detail_api(fetch, jobs)
                     return jobs
@@ -246,6 +253,13 @@ class BambooHRScraper(BaseScraper):
         """
         if not isinstance(payload, dict):
             return []
+        # An explicit application-level failure must not masquerade as an
+        # empty board — the silent-empty class this parser guards against.
+        if payload.get("success") is False:
+            raise ScraperError(
+                f"BambooHR widget for {self.company_slug} reported failure "
+                "(success=false)"
+            )
         departments = payload.get("departments")
         if not isinstance(departments, list):
             return []
@@ -261,14 +275,16 @@ class BambooHRScraper(BaseScraper):
             if not isinstance(positions, list):
                 continue
             for position in positions:
+                positions_seen += 1
                 if not isinstance(position, dict):
                     continue
-                positions_seen += 1
                 raw_id = position.get("id")
                 name = position.get("name")
                 if raw_id is None or not isinstance(name, str):
                     continue
-                ats_id = str(raw_id)
+                ats_id = str(raw_id).strip()
+                if not ats_id:
+                    continue
                 if ats_id in seen:
                     continue
                 title = _collapse_ws(name)
@@ -276,8 +292,10 @@ class BambooHRScraper(BaseScraper):
                     continue
                 seen.add(ats_id)
                 raw_url = position.get("url")
-                if isinstance(raw_url, str) and raw_url.startswith(
-                    ("http://", "https://")
+                if (
+                    isinstance(raw_url, str)
+                    and raw_url.startswith(("http://", "https://"))
+                    and urlsplit(raw_url).netloc
                 ):
                     url = raw_url
                 else:
